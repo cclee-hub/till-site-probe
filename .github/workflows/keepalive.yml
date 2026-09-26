@@ -1,0 +1,22 @@
+name: keepalive
+on:
+  schedule:
+    # 每月 3 日 03:17 UTC：空提交维持仓库活动，防 scheduled workflow 因「公开仓 60 天无活动自动停用」规则被停用（余量 30 天）
+    - cron: '17 3 3 * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Keepalive commit
+        run: |
+          git config user.name "keepalive-bot"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "keepalive: $(date -u '+%F %T UTC')"
+          git push

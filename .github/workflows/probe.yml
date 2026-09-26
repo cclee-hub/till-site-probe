@@ -1,0 +1,183 @@
+name: site-probe
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Restore probe state
+        uses: actions/cache@v4
+        with:
+          path: probe-state
+          key: probe-state-v3-${{ github.run_id }}
+          restore-keys: |
+            probe-state-v3-
+
+      - name: Probe sites and report to ops-monitor center
+        env:
+          CENTER_URL: ${{ secrets.CENTER_URL }}
+          CENTER_KEY: ${{ secrets.CENTER_KEY }}
+          CUSTOMER_ID: ${{ secrets.CUSTOMER_ID }}
+          PROBE_DOMAINS: ${{ secrets.PROBE_DOMAINS }}
+          CERT_DOMAINS: ${{ secrets.CERT_DOMAINS }}
+        run: |
+          set -u
+          mkdir -p probe-state
+          RUN_URL="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          NOW_UTC=$(date -u '+%F %T UTC')
+
+          # 跃迁告警：POST /alert source=gha（dedup 与客户端同构 <rule>:alert|recovered:<first_seen_epoch>，重发 :r<N>）
+          alert() {
+          python3 - "$CENTER_URL" "$CENTER_KEY" "$CUSTOMER_ID" "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+          import json, sys, urllib.request
+          from datetime import datetime
+          url, key, cid, rule, status, dedup, title, body, value = sys.argv[1:10]
+          payload = json.dumps({"customer_id": cid, "host": "till-site-probe", "cli_version": "0.0.0",
+                                "source": "gha", "rule": rule, "status": status, "title": title,
+                                "body": body, "value": float(value), "dedup_key": dedup,
+                                "ts": datetime.utcnow().isoformat() + "+00:00"}).encode()
+          req = urllib.request.Request(url + "/alert", data=payload, method="POST")
+          req.add_header("Content-Type", "application/json")
+          req.add_header("X-API-Key", key)
+          print(urllib.request.urlopen(req, timeout=30).read().decode())
+          PY
+          }
+
+          # 每轮归档：POST /report kind=probe-ext（静默检测证据 + 月报汇聚）
+          report() {
+          python3 - "$CENTER_URL" "$CENTER_KEY" "$CUSTOMER_ID" "$1" "$2" <<'PY'
+          import json, sys, urllib.request
+          url, key, cid, md, flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], int(sys.argv[5])
+          payload = json.dumps({"customer_id": cid, "host": "till-site-probe",
+                                "kind": "probe-ext", "content_md": md, "flagged": flag}).encode()
+          req = urllib.request.Request(url + "/report", data=payload, method="POST")
+          req.add_header("Content-Type", "application/json")
+          req.add_header("X-API-Key", key)
+          print(urllib.request.urlopen(req, timeout=30).read().decode())
+          PY
+          }
+
+          TABLE=""
+          FLAGGED=0
+          for D in $PROBE_DOMAINS; do
+            TRIES=0
+            CODE=""
+            for i in 1 2 3; do
+              CODE=$(curl -sk -o /dev/null -w '%{http_code}' --max-time 15 "https://$D/" || true)
+              case "$CODE" in 200|301|302|307|308) TRIES=$((TRIES+1)); sleep 20;; *) break;; esac
+            done
+
+            # 状态文件："<连续失败轮数> <首轮失败epoch>"（v3；旧裸数字回落 epoch=now）
+            SF="probe-state/$D.fail"
+            LINE=$(cat "$SF" 2>/dev/null || echo "0")
+            PREV=${LINE%% *}
+            BASE_EP=${LINE#* }
+            case "$BASE_EP" in "$LINE"|"") BASE_EP=$(date +%s);; esac
+
+            if [ "$TRIES" -lt 3 ]; then
+              FLAGGED=1
+              N=$((PREV+1))
+              if [ "$PREV" -eq 0 ]; then BASE_EP=$(date +%s); fi
+              echo "$N $BASE_EP" > "$SF"
+              if [ "$N" -eq 2 ]; then
+                echo "ALERT RESP: $(alert "probe:$D" alert "probe:$D:alert:$BASE_EP" "站点不可达: $D (HTTP $CODE, 连续${N}次)" "GitHub Actions 连续 2 轮探测失败
+          站点: $D
+          HTTP: $CODE
+          Run: $RUN_URL
+          时间: $NOW_UTC" 0)"
+              elif [ "$PREV" -ge 2 ] && [ $(( (N - 2) % 4 )) -eq 0 ]; then
+                RN=$(( (N - 2) / 4 ))
+                echo "RE-ALERT RESP: $(alert "probe:$D" alert "probe:$D:alert:$BASE_EP:r$RN" "站点持续不可达: $D (已 ${N} 轮 ≈ $((N/2)) 小时)" "持续失败周期重发
+          站点: $D
+          连续失败轮数: $N
+          Run: $RUN_URL
+          时间: $NOW_UTC" 0)"
+              else
+                echo "failing: $D (HTTP $CODE, 连续${N}轮，未达告警/重发点)"
+              fi
+              TABLE="${TABLE}
+          | $D | FAIL | $CODE | 连续${N}轮 |"
+            else
+              if [ "$PREV" -ge 2 ]; then
+                echo "RECOVERED RESP: $(alert "probe:$D" recovered "probe:$D:recovered:$BASE_EP" "站点恢复: $D" "站点已恢复
+          HTTP: $CODE
+          Run: $RUN_URL
+          时间: $NOW_UTC" 1)"
+              fi
+              rm -f "$SF"
+              echo "$D OK"
+              TABLE="${TABLE}
+          | $D | OK | $CODE | 3/3 |"
+            fi
+          done
+
+          # 证书到期腿：4 域名边缘握手读 notAfter，剩余 <21 天告警（跃迁一次 + ~24h 重发 + 恢复通知）；握手失败不告警（可达性由站点探针覆盖）
+          CERT_TABLE=""
+          ALERT_DAYS=21
+          for D in $CERT_DOMAINS; do
+            END_STR=$(echo | timeout 20 openssl s_client -connect "$D:443" -servername "$D" 2>/dev/null | openssl x509 -noout -enddate 2>/dev/null | cut -d= -f2 || true)
+            if [ -n "$END_STR" ]; then
+              DAYS=$(( ( $(date -u -d "$END_STR" +%s) - $(date -u +%s) ) / 86400 ))
+            else
+              DAYS=-1
+            fi
+            SF="probe-state/$D.cert"
+            LINE=$(cat "$SF" 2>/dev/null || echo "0")
+            PREV=${LINE%% *}
+            BASE_EP=${LINE#* }
+            case "$BASE_EP" in "$LINE"|"") BASE_EP=$(date +%s);; esac
+
+            if [ "$DAYS" -ge 0 ] && [ "$DAYS" -lt "$ALERT_DAYS" ]; then
+              FLAGGED=1
+              N=$((PREV+1))
+              if [ "$PREV" -eq 0 ]; then BASE_EP=$(date +%s); fi
+              echo "$N $BASE_EP" > "$SF"
+              if [ "$N" -eq 1 ]; then
+                echo "CERT ALERT RESP: $(alert "cert-expiry:$D" alert "cert-expiry:$D:alert:$BASE_EP" "证书临期: $D 剩余 ${DAYS} 天" "边缘证书剩余有效期低于 ${ALERT_DAYS} 天（续期链可能断裂）
+          域名: $D
+          剩余: ${DAYS} 天（至 $END_STR）
+          Run: $RUN_URL
+          时间: $NOW_UTC" "$DAYS")"
+              elif [ $((N % 48)) -eq 0 ]; then
+                RN=$((N/48))
+                echo "CERT RE-ALERT RESP: $(alert "cert-expiry:$D" alert "cert-expiry:$D:alert:$BASE_EP:r$RN" "证书持续临期: $D 剩余 ${DAYS} 天（已 ≈$((N/2)) 小时未解决）" "证书临期周期重发
+          域名: $D
+          剩余: ${DAYS} 天
+          Run: $RUN_URL
+          时间: $NOW_UTC" "$DAYS")"
+              fi
+              CERT_TABLE="${CERT_TABLE}
+          | $D | EXPIRING | ${DAYS} 天 | 至 $END_STR |"
+            elif [ "$DAYS" -lt 0 ]; then
+              CERT_TABLE="${CERT_TABLE}
+          | $D | N/A | - | 握手失败（可达性由站点探针覆盖） |"
+            else
+              if [ "$PREV" -ge 1 ]; then
+                echo "CERT RECOVERED RESP: $(alert "cert-expiry:$D" recovered "cert-expiry:$D:recovered:$BASE_EP" "证书临期恢复: $D 剩余 ${DAYS} 天" "证书已续期
+          域名: $D
+          剩余: ${DAYS} 天
+          Run: $RUN_URL
+          时间: $NOW_UTC" 1)"
+              fi
+              rm -f "$SF"
+              CERT_TABLE="${CERT_TABLE}
+          | $D | OK | ${DAYS} 天 | 至 $END_STR |"
+            fi
+          done
+
+          REPORT_MD="# 外部探针报告 $NOW_UTC
+
+          | 站点 | 结果 | HTTP | 口径 |
+          |---|---|---|---|$TABLE
+
+          ## 证书到期（边缘握手，<$ALERT_DAYS 天告警）
+
+          | 域名 | 状态 | 剩余 | 有效期至 |
+          |---|---|---|---|$CERT_TABLE
+
+          Run: $RUN_URL"
+          echo "REPORT RESP: $(report "$REPORT_MD" "$FLAGGED")"
