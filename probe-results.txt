@@ -1,0 +1,14 @@
+== runner egress IP ==
+64.236.215.51
+== api.js (runner -> google) ==
+HTTP 200 len 976
+== siteverify POST (runner -> google) ==
+HTTP 200 {
+  "success": false,
+  "error-codes": [
+    "invalid-input-response"
+  ]
+}
+== form4 faithful POST (runner -> endlesssurf.cn) ==
+无token: | 确认页: True | 错误: ["The email address entered is invalid.", "The reCAPTCHA was invalid. Go back and try it again.", "The email address entered is invalid.", "The reCAPTCHA was invalid. Go back and try it again."]
+假token: | 确认页: True | 错误: ["The email address entered is invalid.", "The reCAPTCHA was invalid. Go back and try it again.", "The email address entered is invalid.", "The reCAPTCHA was invalid. Go back and try it again."]
