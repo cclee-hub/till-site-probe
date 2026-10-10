@@ -2,7 +2,7 @@ name: gf-overseas-probe
 on:
   push:
     paths:
-      - 'gf-overseas-probe.yml'
+      - '.github/workflows/gf-overseas-probe.yml'
 permissions:
   contents: write
 jobs:
